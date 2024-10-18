@@ -1,33 +1,101 @@
-﻿using System.Collections.Immutable;
+﻿using System;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Reflection;
+using System.Threading;
 using Credfeto.Version.Information.Generator.Builders;
 using Credfeto.Version.Information.Generator.Helpers;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Diagnostics;
 
 namespace Credfeto.Version.Information.Generator;
 
 [Generator(LanguageNames.CSharp)]
-public sealed class VersionInformationCodeGenerator : ISourceGenerator
+public sealed class VersionInformationCodeGenerator : IIncrementalGenerator
 {
     private const string CLASS_NAME = "VersionInformation";
 
-    public void Initialize(GeneratorInitializationContext context)
+    public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        // nothing to do here - no initialization required
+        IncrementalValuesProvider<(NamespaceGeneration? classInfo, ErrorInfo? errorInfo)> namespaces =
+            context.SyntaxProvider.CreateSyntaxProvider(predicate: static (n, _) => n is NamespaceDeclarationSyntax or FileScopedNamespaceDeclarationSyntax, transform: GetNamespace);
+
+        IncrementalValuesProvider<((NamespaceGeneration? classInfo, ErrorInfo? errorInfo) Left, AnalyzerConfigOptionsProvider Right)> withOptions =
+            namespaces.Combine(context.AnalyzerConfigOptionsProvider);
+
+        context.RegisterSourceOutput(source: withOptions, action: GenerateVersionInformation);
     }
 
-    public void Execute(GeneratorExecutionContext context)
+    private static (NamespaceGeneration? namespaceInfo, ErrorInfo? errorInfo) GetNamespace(GeneratorSyntaxContext generatorSyntaxContext, CancellationToken cancellationToken)
     {
-        ImmutableDictionary<string, string> attributes = ExtractAttributes(context);
+        if (generatorSyntaxContext.Node is not NamespaceDeclarationSyntax and not FileScopedNamespaceDeclarationSyntax)
+        {
+            return (null, InvalidInfo(generatorSyntaxContext));
+        }
 
-        string assemblyNamespace = GetAssemblyNamespace(context);
-        string product = GetAssemblyProduct(context: context, attributes: attributes, assemblyNamespace: assemblyNamespace);
-        string version = CleanVersion(GetAssemblyVersion(context: context, attributes: attributes));
+        Compilation compilation = generatorSyntaxContext.SemanticModel.Compilation;
+
+        AssemblyIdentity assembly = GetAssembly(compilation);
+
+        ImmutableDictionary<string, string> attributes = ExtractAttributes(compilation.Assembly);
+
+        return (new NamespaceGeneration(assembly: assembly, attributes: attributes), null);
+    }
+
+    private static ErrorInfo InvalidInfo(in GeneratorSyntaxContext generatorSyntaxContext)
+    {
+        return new ErrorInfo(generatorSyntaxContext.Node.GetLocation(), new InvalidOperationException("Expected a namespace declaration"));
+    }
+
+    private static AssemblyIdentity GetAssembly(Compilation compilation)
+    {
+        return compilation.Assembly.Identity;
+    }
+
+    private static void ReportException(Location location, in SourceProductionContext context, Exception exception)
+    {
+        context.ReportDiagnostic(diagnostic: Diagnostic.Create(new(id: "VER002",
+                                                                   title: "Unhandled Exception",
+                                                                   exception.Message + ' ' + exception.StackTrace,
+                                                                   category: RuntimeVersionInformation.ToolName,
+                                                                   defaultSeverity: DiagnosticSeverity.Error,
+                                                                   isEnabledByDefault: true),
+                                                               location: location));
+    }
+
+    private static void GenerateVersionInformation(SourceProductionContext sourceProductionContext,
+                                                   ((NamespaceGeneration? namespaceInfo, ErrorInfo? errorInfo) Left, AnalyzerConfigOptionsProvider Right) item)
+    {
+        if (item.Left.errorInfo is not null)
+        {
+            ErrorInfo ei = item.Left.errorInfo.Value;
+            ReportException(location: ei.Location, context: sourceProductionContext, exception: ei.Exception);
+
+            return;
+        }
+
+        if (item.Left.namespaceInfo is null)
+        {
+            return;
+        }
+
+        GenerateVersionInformation(sourceProductionContext: sourceProductionContext, namespaceInfo: item.Left.namespaceInfo.Value, analyzerConfigOptionsProvider: item.Right);
+    }
+
+    private static void GenerateVersionInformation(in SourceProductionContext sourceProductionContext,
+                                                   in NamespaceGeneration namespaceInfo,
+                                                   AnalyzerConfigOptionsProvider analyzerConfigOptionsProvider)
+    {
+        ImmutableDictionary<string, string> attributes = namespaceInfo.Attributes;
+
+        string assemblyNamespace = namespaceInfo.Namespace;
+        string product = GetAssemblyProduct(analyzerConfigOptionsProvider: analyzerConfigOptionsProvider, attributes: attributes, assemblyNamespace: assemblyNamespace);
+        string version = CleanVersion(GetAssemblyVersion(assemblyIdentity: namespaceInfo.Assembly, attributes: attributes));
 
         CodeBuilder source = BuildSource(assemblyNamespace: assemblyNamespace, version: version, product: product, attributes: attributes);
 
-        context.AddSource($"{assemblyNamespace}.{CLASS_NAME}.generated.cs", sourceText: source.Text);
+        sourceProductionContext.AddSource($"{assemblyNamespace}.{CLASS_NAME}.generated.cs", sourceText: source.Text);
     }
 
     private static CodeBuilder BuildSource(string assemblyNamespace, string version, string product, in ImmutableDictionary<string, string> attributes)
@@ -69,9 +137,8 @@ public sealed class VersionInformationCodeGenerator : ISourceGenerator
         }
     }
 
-    private static ImmutableDictionary<string, string> ExtractAttributes(in GeneratorExecutionContext context)
+    private static ImmutableDictionary<string, string> ExtractAttributes(in IAssemblySymbol ass)
     {
-        IAssemblySymbol ass = context.Compilation.Assembly;
         ImmutableArray<AttributeData> attibuteData = ass.GetAttributes();
 
         ImmutableDictionary<string, string> attributes = ImmutableDictionary<string, string>.Empty;
@@ -99,9 +166,9 @@ public sealed class VersionInformationCodeGenerator : ISourceGenerator
         return attributes;
     }
 
-    private static string GetAssemblyProduct(in GeneratorExecutionContext context, ImmutableDictionary<string, string> attributes, string assemblyNamespace)
+    private static string GetAssemblyProduct(in AnalyzerConfigOptionsProvider analyzerConfigOptionsProvider, ImmutableDictionary<string, string> attributes, string assemblyNamespace)
     {
-        if (context.AnalyzerConfigOptions.GlobalOptions.TryGetValue(key: "build_property.rootnamespace", out string? product) && !string.IsNullOrWhiteSpace(product))
+        if (analyzerConfigOptionsProvider.GlobalOptions.TryGetValue(key: "build_property.rootnamespace", out string? product) && !string.IsNullOrWhiteSpace(product))
         {
             return product;
         }
@@ -114,16 +181,11 @@ public sealed class VersionInformationCodeGenerator : ISourceGenerator
         return assemblyNamespace;
     }
 
-    private static string GetAssemblyVersion(in GeneratorExecutionContext context, ImmutableDictionary<string, string> attributes)
+    private static string GetAssemblyVersion(in AssemblyIdentity assemblyIdentity, ImmutableDictionary<string, string> attributes)
     {
         return attributes.TryGetValue(nameof(AssemblyInformationalVersionAttribute), out string? version) && !string.IsNullOrWhiteSpace(version)
             ? version
-            : context.Compilation.Assembly.Identity.Version.ToString();
-    }
-
-    private static string GetAssemblyNamespace(in GeneratorExecutionContext context)
-    {
-        return context.Compilation.Assembly.Identity.Name;
+            : assemblyIdentity.Version.ToString();
     }
 
     private static string CleanVersion(string source)
